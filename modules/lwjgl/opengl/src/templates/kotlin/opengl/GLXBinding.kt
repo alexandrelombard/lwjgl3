@@ -83,6 +83,9 @@ val GLXBinding = Generator.register(object : APIBinding(
 }""")
     }
 
+    override fun PrintWriter.generateKotlin() {
+        TODO("Not yet implemented")
+    }
 })
 
 fun String.nativeClassGLX(templateName: String, postfix: String = "", init: (NativeClass.() -> Unit)? = null) = nativeClass(

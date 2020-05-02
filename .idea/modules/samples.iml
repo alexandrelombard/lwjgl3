@@ -65,5 +65,6 @@
     <orderEntry type="module" module-name="lwjgl.xxhash" scope="TEST" />
     <orderEntry type="module" module-name="lwjgl.yoga" scope="TEST" />
     <orderEntry type="module" module-name="lwjgl.zstd" scope="TEST" />
+    <orderEntry type="library" name="KotlinJavaRuntime" level="project" />
   </component>
 </module>

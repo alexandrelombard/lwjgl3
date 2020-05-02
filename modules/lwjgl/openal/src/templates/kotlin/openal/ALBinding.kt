@@ -86,6 +86,9 @@ private val ALBinding = Generator.register(object : APIBinding(
 }""")
     }
 
+    override fun PrintWriter.generateKotlin() {
+        TODO("Not yet implemented")
+    }
 })
 
 // DSL Extensions

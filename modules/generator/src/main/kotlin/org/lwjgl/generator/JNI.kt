@@ -95,6 +95,43 @@ object JNI : GeneratorTargetNative(Module.CORE, "JNI") {
         println("\n}")
     }
 
+    override fun PrintWriter.generateKotlin() {
+        generateKotlinPreamble()
+        print("""class JNI {
+
+    companion object {
+        init {
+            Library.initialize();
+        }
+    }
+
+    private constructor() {}
+
+    // Pointer API
+
+""")
+        sortedSignatures.forEach {
+            print("${t}public static native ${it.returnType.nativeMethodType} ${it.signature}(")
+            if (it.arguments.isNotEmpty())
+                print(it.arguments.asSequence()
+                    .mapIndexed { i, param -> "${param.nativeMethodType} param$i" }
+                    .joinToString(", ", postfix = ", "))
+            println("long $FUNCTION_ADDRESS);")
+        }
+
+        println("\n$t// Array API\n")
+
+        sortedSignaturesArray.forEach {
+            print("${t}external fun ${it.returnType.nativeMethodType} ${it.signature}(")
+            if (it.arguments.isNotEmpty())
+                print(it.arguments.asSequence()
+                    .mapIndexed { i, param -> if (param is ArrayType<*>) "@Nullable ${param.mapping.primitive}[] param$i" else "${param.nativeMethodType} param$i" }
+                    .joinToString(", ", postfix = ", "))
+            println("long $FUNCTION_ADDRESS);")
+        }
+        println("\n}")
+    }
+
     private val NativeType.nativeType
         get() = if (this.isPointer)
             "intptr_t"

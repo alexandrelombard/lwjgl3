@@ -4,6 +4,9 @@
  */
 package org.lwjgl.generator
 
+import org.lwjgl.generator.forEachWithMore
+import org.lwjgl.generator.lastModified
+import org.lwjgl.generator.upperCaseFirst
 import java.io.*
 import java.lang.reflect.*
 import java.nio.*
@@ -278,6 +281,12 @@ class Generator(private val moduleRoot: String) {
             it.generateJava()
         }
 
+        val outputKotlin = Paths
+            .get("$moduleRoot/${nativeClass.module.path}/src/generated/kotlin/commonMain/${nativeClass.packageName.replace('.', '/')}/${nativeClass.className}.kt")
+        generateOutput(nativeClass, outputKotlin, lmt) {
+            it.generateKotlin()
+        }
+
         if (!nativeClass.skipNative) {
             generateNative(nativeClass) {
                 generateOutput(nativeClass, it) { out ->
@@ -309,6 +318,12 @@ class Generator(private val moduleRoot: String) {
 
         generateOutput(target, outputJava, lmt) {
             it.generateJava()
+        }
+
+        val outputKotlin = Paths
+            .get("$modulePath/src/generated/kotlin/commonMain/${target.packageName.replace('.', '/')}/${target.className}.kt")
+        generateOutput(target, outputKotlin, lmt) {
+            it.generateKotlin()
         }
 
         if (target is GeneratorTargetNative && !target.skipNative) {

@@ -176,6 +176,9 @@ private val GLESBinding = register(object : APIBinding(
 }""")
     }
 
+    override fun PrintWriter.generateKotlin() {
+        TODO("Not yet implemented")
+    }
 })
 
 fun String.nativeClassGLES(

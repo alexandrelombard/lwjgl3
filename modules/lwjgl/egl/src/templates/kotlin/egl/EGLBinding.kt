@@ -102,6 +102,9 @@ private val EGLBinding = Generator.register(object : APIBinding(
         print("\n}")
     }
 
+    override fun PrintWriter.generateKotlin() {
+        TODO("Not yet implemented")
+    }
 })
 
 fun String.nativeClassEGL(

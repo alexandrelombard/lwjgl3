@@ -200,6 +200,9 @@ val VK_BINDING_INSTANCE = Generator.register(object : APIBinding(
         )
     }
 
+    override fun PrintWriter.generateKotlin() {
+        TODO("Not yet implemented")
+    }
 })
 
 val VK_BINDING_DEVICE = Generator.register(object : GeneratorTarget(Module.VULKAN, CAPS_DEVICE) {
@@ -295,6 +298,9 @@ val VK_BINDING_DEVICE = Generator.register(object : GeneratorTarget(Module.VULKA
         )
     }
 
+    override fun PrintWriter.generateKotlin() {
+        TODO("Not yet implemented")
+    }
 })
 
 // DSL Extensions

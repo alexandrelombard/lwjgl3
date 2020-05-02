@@ -122,6 +122,9 @@ private val CLBinding = Generator.register(object : APIBinding(
         print("\n}")
     }
 
+    override fun PrintWriter.generateKotlin() {
+        TODO("Not yet implemented")
+    }
 })
 
 // DSL Extensions

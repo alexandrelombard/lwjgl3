@@ -108,6 +108,7 @@ abstract class SimpleBinding(
     private val libraryExpression: String
 ) : APIBinding(module, "*") { // TODO
     override fun PrintWriter.generateJava() = Unit
+    override fun PrintWriter.generateKotlin() = Unit
     override fun generateFunctionAddress(writer: PrintWriter, function: Func) {
         writer.println("$t${t}long ${if (function has Address) RESULT else FUNCTION_ADDRESS} = Functions.${function.simpleName};")
     }
@@ -530,6 +531,177 @@ class NativeClass internal constructor(
                                 "\n${t}static { $library }"
                             else
                                 "\n${t}static { Library.loadSystem(System::load, System::loadLibrary, $className.class, \"${module.java}\", Platform.mapLibraryNameBundled(\"$library\")); }"
+                        })
+            }
+        }
+
+        if (hasFunctions || binding is SimpleBinding) {
+            if (binding != null) {
+                if (functions.any(Func::hasCustomJNI))
+                    libraryInit()
+
+                if (binding is SimpleBinding || functions.any { !it.hasExplicitFunctionAddress }) {
+                    println("""
+    ${if (isOpen) "protected" else "private"} $className() {
+        throw new UnsupportedOperationException();
+    }""")
+                    binding.generateFunctionSetup(this, this@NativeClass)
+                }
+                printCustomMethods(static = true)
+            } else {
+                libraryInit()
+
+                printCustomMethods(static = true)
+
+                // This allows binding classes to be "statically" extended. Not a good practice, but usable with static imports.
+                println("""
+    ${if (isOpen) "protected" else "private"} $className() {
+        throw new UnsupportedOperationException();
+    }""")
+            }
+        } else {
+            println("\n$t${if (isOpen) "protected" else "private"} $className() {}")
+        }
+
+        genFunctions.forEach { func ->
+            if (!func.hasParam { it.nativeType is ArrayType<*> })
+                println("\n$t// --- [ ${func.name} ] ---")
+            try {
+                func.generateMethods(this)
+            } catch (e: Exception) {
+                throw RuntimeException("Uncaught exception while generating method: $className.${func.simpleName}", e)
+            }
+        }
+
+        printCustomMethods(static = false)
+
+        print("\n}")
+    }
+
+    override fun PrintWriter.generateKotlin() {
+        print(HEADER)
+        println("package $packageName\n")
+
+        val hasFunctions = _functions.isNotEmpty()
+        if (hasFunctions || binding is SimpleBinding) {
+            // TODO: This is horrible. Refactor so that we build imports after code generation.
+            if (functions.any {
+                    (it.returns.nativeType.isReference && it.returnsNull) || it.parameters.any { param ->
+                        param.nativeType.isReference && param.has(nullable)
+                    } || it.has<MapPointer>()
+                }) {
+                println("import javax.annotation.*;\n")
+            }
+
+            val hasBuffers = functions.any { it.returns.nativeType.isPointerData || it.hasParam { param -> param.nativeType.isPointerData } }
+
+            if (hasBuffers) {
+                if (functions.any {
+                        (it.returns.isBufferPointer && it.returns.nativeType.mapping !== PointerMapping.DATA_POINTER && it.returns.nativeType !is CharSequenceType)
+                        ||
+                        it.hasParam { param -> param.isBufferPointer && param.nativeType.mapping !== PointerMapping.DATA_POINTER }
+                    })
+                    println("import java.nio.*;\n")
+
+                val needsCustomBuffer: NativeType.() -> Boolean = {
+                    this is PointerType<*> && this.elementType.run { this is PointerType<*> || (mapping == PrimitiveMapping.POINTER && this !is StructType) || mapping == PrimitiveMapping.CLONG }
+                }
+                if (functions.any {
+                        it.returns.nativeType.needsCustomBuffer() || it.hasParam { param ->
+                            param.nativeType.needsCustomBuffer() || param.has<MultiType> { types.contains(PointerMapping.DATA_POINTER) || types.contains(PointerMapping.DATA_CLONG) }
+                        }
+                    })
+                    println("import org.lwjgl.*;\n")
+            }
+
+            val functions = this@NativeClass.functions
+                .filter { !it.has<Reuse>() }
+
+            val hasMemoryStack = hasBuffers && functions.any { func ->
+                func.hasParam {
+                    it.nativeType is PointerType<*> &&
+                    (
+                    it.has<Return>() ||
+                    it.has<SingleValue>() ||
+                    (it.isAutoSizeResultOut && func.hideAutoSizeResultParam) ||
+                    it.has<PointerArray>() ||
+                    (it.nativeType is CharSequenceType && it.isInput)
+                    )
+                }
+            }
+
+            if ((hasFunctions || binding != null) && module !== Module.CORE) {
+                println("import org.lwjgl.system.*\n")
+            }
+
+            if (hasFunctions && (binding is SimpleBinding || (binding != null && functions.any { it.has<MapPointer>() })))
+                println("import org.lwjgl.system.APIUtil.*")
+            if (hasFunctions && ((binding != null && binding !is SimpleBinding) || functions.any { func ->
+                    func.hasParam { param ->
+                        param.nativeType is PointerType<*> && func.getReferenceParam<AutoSize>(param.name).let {
+                            if (it == null)
+                                !param.has<Nullable>() && param.nativeType.elementType !is StructType
+                            else
+                                it.get<AutoSize>().reference != param.name // dependent auto-size
+                        }
+                    }
+                }))
+                println("import org.lwjgl.system.Checks.*")
+            if (binding != null && functions.any { !it.hasCustomJNI || it.hasArrayOverloads })
+                println("import org.lwjgl.system.JNI.*")
+            if (hasMemoryStack)
+                println("import org.lwjgl.system.MemoryStack.*")
+            if (hasBuffers && functions.any {
+                    it.returns.isBufferPointer || it.hasParam { param ->
+                        param.nativeType.let { type -> type is PointerType<*> && type.mapping !== PointerMapping.OPAQUE_POINTER && (type.elementType !is StructType || param.has<Nullable>()) }
+                    }
+                }) {
+                println("import org.lwjgl.system.MemoryUtil.*")
+                if (functions.any { func ->
+                        func.hasParam {
+                            it.has<MultiType> { types.contains(PointerMapping.DATA_POINTER) } && func.hasAutoSizeFor(it)
+                        }
+                    })
+                    println("import org.lwjgl.system.Pointer.*")
+            }
+            println()
+        }
+
+        preamble.printKotlin(this)
+
+        val documentation = super.documentation
+        if (!documentation.isNullOrBlank())
+            println(processDocumentation(documentation).toJavaDoc(indentation = ""))
+        val isOpen = access === Access.PUBLIC && (hasFunctions || extends != null)
+        print("${if(access !== Access.PUBLIC) access.modifier else ""}${if (isOpen) "open " else ""}class $className")
+        extends.let {
+            if (it != null)
+                print(" : ${it.className}")
+        }
+        println(" {")
+
+        constantBlocks.forEach {
+            it.generate(this)
+        }
+
+        fun PrintWriter.libraryInit() {
+            if (module.library != null || binding !is SimpleBinding) {
+                println(if (module.library == null)
+                    "\n${t}companion object { init { Library.initialize() } }"
+                else
+                    module.library.expression(module)
+                        .let { library ->
+                            if (library.contains('\n'))
+                                """
+    companion object {
+        init {
+            ${library.trim()}
+        }
+    }"""
+                            else if (library.endsWith(");"))
+                                "\n${t}companion object { init { $library } }"
+                            else
+                                "\n${t}companion object { init { Library.loadSystem(System::load, System::loadLibrary, $className.class, \"${module.java}\", Platform.mapLibraryNameBundled(\"$library\")); } }"
                         })
             }
         }

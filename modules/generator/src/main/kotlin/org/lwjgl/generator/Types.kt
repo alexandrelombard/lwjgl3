@@ -420,6 +420,12 @@ internal fun NativeType.annotate(type: String) = annotation(type).let {
     else
         "$it $type"
 }
+internal fun NativeType.annotateKotlin(type: String) = annotation(type).let {
+    if (it == null)
+        ""
+    else
+        "$it "
+}
 
 internal val NativeType.castAddressToPointer
     get() = (this is PointerType<*> && this !is ArrayType<*>) || this is StructType

@@ -903,6 +903,10 @@ private class JNILibraryWithInit constructor(
                 )
             }
 
+            override fun PrintWriter.generateKotlin() {
+
+            }
+
             override val skipNative
                 get() = !setupAllocator
 

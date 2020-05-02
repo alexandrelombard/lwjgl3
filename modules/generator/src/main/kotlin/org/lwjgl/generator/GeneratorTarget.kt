@@ -90,6 +90,15 @@ internal class Preamble {
         writer.println()
     }
 
+    fun printKotlin(writer: PrintWriter) {
+        if (javaImports.isEmpty())
+            return
+
+        javaImports.forEach { writer.println("import $it\n") }
+
+        writer.println()
+    }
+
     internal fun printNative(writer: PrintWriter) {
         nativeDirectives.filter { it.beforeIncludes }.forEach {
             writer.println(it.expression)
@@ -210,7 +219,20 @@ abstract class GeneratorTarget(
             println(processDocumentation(documentation).toJavaDoc(indentation = "", see = see, since = since))
     }
 
+    protected fun PrintWriter.generateKotlinPreamble() {
+        print(HEADER)
+        println("package $packageName\n")
+
+        preamble.printJava(this)
+
+        val documentation = this@GeneratorTarget.documentation
+        if (documentation != null)
+            println(processDocumentation(documentation).toJavaDoc(indentation = "", see = see, since = since))
+    }
+
     abstract fun PrintWriter.generateJava()
+
+    abstract fun PrintWriter.generateKotlin()
 
     open fun processDocumentation(documentation: String, forcePackage: Boolean = false): String = processDocumentation(documentation, "", "", forcePackage)
 
@@ -364,6 +386,15 @@ fun packageInfo(
             println(processDocumentation(documentation, forcePackage = true).toJavaDoc(indentation = "", see = see, since = since))
             println("""@org.lwjgl.system.NonnullDefault
 package $packageName;
+""")
+        }
+
+        override fun PrintWriter.generateKotlin() {
+            print(HEADER)
+            println()
+            println(processDocumentation(documentation, forcePackage = true).toJavaDoc(indentation = "", see = see, since = since))
+            println("""@org.lwjgl.system.NonnullDefault
+package $packageName
 """)
         }
     })

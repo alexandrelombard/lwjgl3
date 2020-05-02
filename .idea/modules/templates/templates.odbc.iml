@@ -12,5 +12,6 @@
     <orderEntry type="library" name="KotlinRuntime" level="project" />
     <orderEntry type="module" module-name="generator" />
     <orderEntry type="module" module-name="templates.core" />
+    <orderEntry type="library" name="KotlinJavaRuntime" level="project" />
   </component>
 </module>

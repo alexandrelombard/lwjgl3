@@ -75,6 +75,10 @@ fun config() {
 
 }""")
         }
+
+        override fun PrintWriter.generateKotlin() {
+            TODO("Not yet implemented")
+        }
     })
 }
 

@@ -139,4 +139,7 @@ val OPENVR_FNTABLE_BINDING: APIBinding = Generator.register(object : APIBinding(
         print("\n\n}")
     }
 
+    override fun PrintWriter.generateKotlin() {
+        TODO("Not yet implemented")
+    }
 })

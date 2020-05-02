@@ -189,6 +189,10 @@ import static org.lwjgl.system.MemoryUtil.*;
 }""")
     }
 
+    override fun PrintWriter.generateKotlin() {
+
+    }
+
     internal fun PrintWriter.generateInterface() {
         print(HEADER)
         println("package $packageName;\n")
@@ -270,5 +274,9 @@ internal class CallbackInterface(
 ) : GeneratorTarget(callback.module, "${callback.className}I") {
     override fun PrintWriter.generateJava() = callback.run {
         this@generateJava.generateInterface()
+    }
+
+    override fun PrintWriter.generateKotlin() = callback.run {
+        this@generateKotlin.generateInterface()
     }
 }

@@ -1180,6 +1180,529 @@ ${validations.joinToString("\n")}
 }""")
     }
 
+    override fun PrintWriter.generateKotlin() = generateKotlin(false, 1)
+    private fun PrintWriter.generateKotlin(nested: Boolean, level: Int) {
+        if (alias != null) {
+            usageInput = usageInput or alias.usageInput
+            usageOutput = usageOutput or alias.usageOutput
+            usageResultPointer = usageResultPointer or alias.usageResultPointer
+        }
+
+        val mallocable = mutableMembers().any() || usageOutput || (usageInput && !usageResultPointer)
+        validate(mallocable)
+
+        val nativeLayout = !skipNative
+        if (nativeLayout) {
+            checkNotNull(module.library) {
+                "${t}Missing module library for native layout of struct: ${module.packageKotlin}.$className"
+            }
+        } else if (preamble.hasNativeDirectives) {
+            kotlin.io.println("${t}Unnecessary native directives in struct: ${module.packageKotlin}.$className")
+        }
+
+        if (!nested) {
+            print(HEADER)
+            println("package $packageName\n")
+
+            if (mallocable || members.any { m ->
+                    m.nativeType.let {
+                        (it.mapping === PointerMapping.DATA_POINTER && it is PointerType<*> && (it.elementType !is StructType || m is StructMemberArray)) ||
+                        (it.mapping === PrimitiveMapping.POINTER && m is StructMemberArray && it !is StructType)
+                    }
+                })
+                println("import org.lwjgl.*")
+            println("import org.lwjgl.system.*\n")
+
+            fun Struct.hasChecks(): Boolean = visibleMembers.any {
+                (it is StructMemberArray && it.nativeType !is CharType) ||
+                (
+                (mutable || it.mutable) &&
+                (
+                it is StructMemberArray ||
+                it.nativeType is CharSequenceType ||
+                (it.nativeType is PointerType<*> && !it.has<Nullable>())
+                )
+                ) ||
+                it.isNestedStructDefinition && (it.nativeType as StructType).definition.hasChecks()
+            }
+
+            if (Module.CHECKS && hasChecks())
+                println("import org.lwjgl.system.Checks.*")
+            println("import org.lwjgl.system.MemoryUtil.*")
+            if (nativeLayout || mallocable)
+                println("import org.lwjgl.system.MemoryStack.*")
+        }
+
+        println()
+        preamble.printKotlin(this)
+
+        printDocumentation()
+        if (className != nativeName) {
+            println("@NativeType(\"$nativeNameQualified\")")
+        }
+        print("${if(access !== Access.PUBLIC) access.modifier else ""}${if (nested) "inner " else ""}class $className : ")
+        print(alias?.className ?: "KStruct${if (mallocable) ", KNativeResource" else ""}")
+        println(" {")
+
+        if (alias == null) {
+            print("""
+    companion object {
+        /** The struct size in bytes. */
+        val SIZEOF: Int
+    
+        /** The struct alignment in bytes. */
+        val ALIGNOF: Int
+"""
+            )
+
+            val visibleMembersExceptBitfields = visibleMembers.filter { it.bits == -1 }
+            if (members.isNotEmpty() && (!nativeLayout || visibleMembersExceptBitfields.any())) {
+                val memberCount = getMemberCount(members)
+
+                // Member offset fields
+
+                if (visibleMembersExceptBitfields.any()) {
+                    print(
+                        """
+        /** The struct member offsets. */
+"""
+                    )
+                    generateOffsetFieldsKotlin(visibleMembersExceptBitfields)
+                    println()
+                }
+
+                if(visibleMembers.any()) {
+                    println("")
+                    generateStaticGettersKotlin(visibleMembers)
+
+                    if (hasMutableMembers(visibleMembers)) {
+                        println()
+                        generateStaticSettersKotlin(mutableMembers(visibleMembers))
+                    }
+                }
+
+                print(
+                    """
+        init {"""
+                )
+                if (static != null)
+                    print(
+                        """
+            $static
+"""
+                    )
+
+                // Member offset initialization
+
+                if (nativeLayout) {
+                    print(
+                        """
+            ${module.library!!.expression(module)}
+
+            stackPush().use { stack ->
+                val offsets = stack.mallocInt(${memberCount + 1})
+                SIZEOF = offsets(memAddress(offsets))
+
+"""
+                    )
+                    generateOffsetInitKotlin(true, members, indentation = "$t$t$t$t")
+                    println(
+                        """
+                ALIGNOF = offsets.get($memberCount)
+            }"""
+                    )
+                } else {
+                    print(
+                        """
+            val layout: Layout = """
+                    )
+                    generateLayout(this@Struct, indentation = "$t$t$t")
+                    print(
+                        """
+
+            SIZEOF = layout.getSize()
+            ALIGNOF = layout.getAlignment()
+
+"""
+                    )
+                    generateOffsetInitKotlin(false, members)
+                }
+
+                println("$t$t}")
+                println("$t}")
+            } else if (nativeLayout) {
+                print(
+                    """
+        init {"""
+                )
+                if (static != null)
+                    print(
+                        """
+            $static
+"""
+                    )
+                println(
+                    """
+            ${module.library!!.expression(module)}
+    
+            stackPush().use { stack ->
+                val offsets = stack.mallocInt(1)
+                SIZEOF = offsets(memAddress(offsets))
+                ALIGNOF = offsets.get(0)
+            }
+        }
+    }"""
+                )
+            }
+
+            if (nativeLayout)
+                println(
+                    """
+    private external fun offsets(buffer: Long): Int"""
+                )
+        }
+
+        printCustomMethods(static = true)
+
+        print("""
+    /**
+     * Creates a {@code $className} instance at the current position of the specified {@link ByteBuffer} container. Changes to the buffer's content will be
+     * visible to the struct instance and vice versa.
+     *
+     * <p>The created instance holds a strong reference to the container object.</p>
+     */
+    ${access.modifier}constructor(container: ByteBuffer) :
+        super(${if (alias == null) "memAddress(container), __checkContainer(container, SIZEOF)" else "container"})
+""")
+
+        if (alias == null) {
+            print("""
+    override fun sizeof(): Int { return SIZEOF }
+""")
+        }
+
+        var members = publicMembers
+        if (members.any()) {
+            if (alias == null) {
+                println()
+                generateGettersKotlin(AccessMode.INSTANCE, members)
+            }
+
+            if (hasMutableMembers()) {
+                println()
+                generateSettersKotlin(AccessMode.INSTANCE, settableMembers)
+
+                if (settableMembers.singleOrNull() == null && !containsUnion) {
+                    val javadoc = "Initializes this struct with the specified values."
+                    if (generateAlternativeMultiSetter(settableMembers))
+                        generateMultiSetterKotlin(javadoc, settableMembers, Struct::generateAlternativeMultiSetterParametersKotlin, Struct::generateAlternativeMultiSetterSettersKotlin, MultiSetterMode.ALTER)
+                    else
+                        generateMultiSetterKotlin(javadoc, settableMembers, Struct::generateMultiSetterParametersKotlin, Struct::generateMultiSetterSettersKotlin)
+                }
+
+                print("""
+    /**
+     * Copies the specified struct data to this struct.
+     *
+     * @param src the source struct
+     *
+     * @return this struct
+     */
+    fun set(src: $className): $className {
+        memCopy(src.$ADDRESS, $ADDRESS, SIZEOF)
+        return this
+    }
+""")
+            }
+        }
+
+        print("""
+    // -----------------------------------
+""")
+
+        // Factory constructors
+        if (mallocable) {
+            print("""
+    /** Returns a new {@code $className} instance allocated with {@link MemoryUtil#memAlloc memAlloc}. The instance must be explicitly freed. */
+    fun malloc(): $className {
+        return wrap($className::class, nmemAllocChecked(SIZEOF))
+    }
+
+    /** Returns a new {@code $className} instance allocated with {@link MemoryUtil#memCalloc memCalloc}. The instance must be explicitly freed. */
+    fun calloc(): $className {
+        return wrap($className::class, nmemCallocChecked(1, SIZEOF))
+    }
+
+    /** Returns a new {@code $className} instance allocated with {@link BufferUtils}. */
+    fun create(): $className {
+        val container = BufferUtils.createByteBuffer(SIZEOF)
+        return wrap($className::class, memAddress(container), container)
+    }
+""")
+        }
+
+        print("""
+    /** Returns a new {@code $className} instance for the specified memory address. */
+    fun create(address: Long): $className {
+        return wrap($className::class, address)
+    }
+
+    /** Like {@link #create(long) create}, but returns {@code null} if {@code address} is {@code NULL}. */
+    fun createSafe(address: Long): $className? {
+        return if(address == NULL) null else wrap($className::class, address)
+    }
+""")
+        if (generateBuffer) {
+            if (mallocable) {
+                print("""
+    /**
+     * Returns a new {@link $className.Buffer} instance allocated with {@link MemoryUtil#memAlloc memAlloc}. The instance must be explicitly freed.
+     *
+     * @param $BUFFER_CAPACITY_PARAM the buffer capacity
+     */
+    fun malloc($BUFFER_CAPACITY_PARAM: Int): $className.Buffer {
+        return wrap(Buffer::class, nmemAllocChecked(__checkMalloc($BUFFER_CAPACITY_PARAM, SIZEOF.toLong())), $BUFFER_CAPACITY_PARAM)
+    }
+
+    /**
+     * Returns a new {@link $className.Buffer} instance allocated with {@link MemoryUtil#memCalloc memCalloc}. The instance must be explicitly freed.
+     *
+     * @param $BUFFER_CAPACITY_PARAM the buffer capacity
+     */
+    fun calloc($BUFFER_CAPACITY_PARAM: Int): $className.Buffer {
+        return wrap(Buffer::class, nmemCallocChecked($BUFFER_CAPACITY_PARAM, SIZEOF), $BUFFER_CAPACITY_PARAM)
+    }
+
+    /**
+     * Returns a new {@link $className.Buffer} instance allocated with {@link BufferUtils}.
+     *
+     * @param $BUFFER_CAPACITY_PARAM the buffer capacity
+     */
+    fun create($BUFFER_CAPACITY_PARAM: Int): $className.Buffer {
+        val container = __create($BUFFER_CAPACITY_PARAM, SIZEOF)
+        return wrap(Buffer::class, memAddress(container), $BUFFER_CAPACITY_PARAM, container)
+    }
+""")
+            }
+
+            print("""
+    /**
+     * Create a {@link $className.Buffer} instance at the specified memory.
+     *
+     * @param address  the memory address
+     * @param $BUFFER_CAPACITY_PARAM the buffer capacity
+     */
+    fun create(address: Long, $BUFFER_CAPACITY_PARAM: Int): $className.Buffer {
+        return wrap(Buffer::class, address, $BUFFER_CAPACITY_PARAM);
+    }
+
+    /** Like {@link #create(long, int) create}, but returns {@code null} if {@code address} is {@code NULL}. */
+    fun createSafe(address: Long, $BUFFER_CAPACITY_PARAM: Int): $className.Buffer? {
+        return if(address == NULL) null else wrap(Buffer::class, address, $BUFFER_CAPACITY_PARAM)
+    }
+""")
+        }
+
+        if (mallocable) {
+            print("""
+    // -----------------------------------
+
+    /** Returns a new {@code $className} instance allocated on the thread-local {@link MemoryStack}. */
+    fun mallocStack(): $className {
+        return mallocStack(stackGet())
+    }
+
+    /** Returns a new {@code $className} instance allocated on the thread-local {@link MemoryStack} and initializes all its bits to zero. */
+    fun callocStack(): $className {
+        return callocStack(stackGet())
+    }
+
+    /**
+     * Returns a new {@code $className} instance allocated on the specified {@link MemoryStack}.
+     *
+     * @param stack the stack from which to allocate
+     */
+    fun mallocStack(stack: MemoryStack): $className {
+        return wrap($className::class, stack.nmalloc(ALIGNOF, SIZEOF))
+    }
+
+    /**
+     * Returns a new {@code $className} instance allocated on the specified {@link MemoryStack} and initializes all its bits to zero.
+     *
+     * @param stack the stack from which to allocate
+     */
+    fun callocStack(stack: MemoryStack): $className {
+        return wrap($className::class, stack.ncalloc(ALIGNOF, 1, SIZEOF))
+    }
+""")
+            if (generateBuffer) {
+                print("""
+    /**
+     * Returns a new {@link $className.Buffer} instance allocated on the thread-local {@link MemoryStack}.
+     *
+     * @param $BUFFER_CAPACITY_PARAM the buffer capacity
+     */
+    fun mallocStack($BUFFER_CAPACITY_PARAM: Int): $className.Buffer {
+        return mallocStack($BUFFER_CAPACITY_PARAM, stackGet())
+    }
+
+    /**
+     * Returns a new {@link $className.Buffer} instance allocated on the thread-local {@link MemoryStack} and initializes all its bits to zero.
+     *
+     * @param $BUFFER_CAPACITY_PARAM the buffer capacity
+     */
+    fun callocStack($BUFFER_CAPACITY_PARAM: Int): $className.Buffer {
+        return callocStack($BUFFER_CAPACITY_PARAM, stackGet())
+    }
+
+    /**
+     * Returns a new {@link $className.Buffer} instance allocated on the specified {@link MemoryStack}.
+     *
+     * @param stack the stack from which to allocate
+     * @param $BUFFER_CAPACITY_PARAM the buffer capacity
+     */
+    fun mallocStack($BUFFER_CAPACITY_PARAM: Int, stack: MemoryStack): $className.Buffer {
+        return wrap(Buffer::class, stack.nmalloc(ALIGNOF, $BUFFER_CAPACITY_PARAM * SIZEOF).toInt(), $BUFFER_CAPACITY_PARAM)
+    }
+
+    /**
+     * Returns a new {@link $className.Buffer} instance allocated on the specified {@link MemoryStack} and initializes all its bits to zero.
+     *
+     * @param stack the stack from which to allocate
+     * @param $BUFFER_CAPACITY_PARAM the buffer capacity
+     */
+    fun callocStack($BUFFER_CAPACITY_PARAM: Int, stack: MemoryStack): $className.Buffer {
+        return wrap(Buffer::class, stack.ncalloc(ALIGNOF, $BUFFER_CAPACITY_PARAM, SIZEOF).toInt(), $BUFFER_CAPACITY_PARAM)
+    }
+""")
+            }
+        }
+
+        if (alias == null) {
+            print("""
+    // -----------------------------------
+""")
+
+            members = visibleMembers
+            if (members.any()) {
+                if (hasMutableMembers(visibleMembers)) {
+                    if (Module.CHECKS && validations.any()) {
+                        println(
+                            """
+    /**
+     * Validates pointer members that should not be {@code NULL}.
+     *
+     * @param $STRUCT the struct to validate
+     */
+    fun validate($STRUCT: Long) {
+${validations.joinToString("\n")}
+    }
+
+    /**
+     * Calls {@link #validate(long)} for each struct contained in the specified struct array.
+     *
+     * @param array the struct array to validate
+     * @param count the number of structs in {@code array}
+     */
+    fun validate(array: Long, count: Int) {
+        for (int i = 0; i < count; i++) {
+            validate(array + Integer.toUnsignedLong(i) * SIZEOF)
+        }
+    }""")
+                    }
+                }
+            }
+        }
+
+        printCustomMethods(static = false)
+
+        if (generateBuffer) {
+            println("\n$t// -----------------------------------")
+
+            print("""
+    /** An array of {@link $className} structs. */
+    inner class Buffer : """)
+
+            print(if (alias == null)
+                "KStructBuffer<$className, Buffer>${if (mallocable) ", KNativeResource" else ""}"
+            else
+                "${alias.className}.Buffer"
+            )
+
+            print(""" {
+
+        private val ELEMENT_FACTORY: $className = $className.create(-1L)
+
+        /**
+         * Creates a new {@code $className.Buffer} instance backed by the specified container.
+         *
+         * Changes to the container's content will be visible to the struct buffer instance and vice versa. The two buffers' position, limit, and mark values
+         * will be independent. The new buffer's position will be zero, its capacity and its limit will be the number of bytes remaining in this buffer divided
+         * by {@link $className#SIZEOF}, and its mark will be undefined.
+         *
+         * <p>The created buffer instance holds a strong reference to the container object.</p>
+         */""")
+
+            print(if (alias == null)
+                """
+        constructor(container: ByteBuffer) : super(container, container.remaining() / SIZEOF)
+        """
+            else
+                """
+        constructor(container: ByteBuffer) : super(container)
+        """)
+
+            print("""
+
+        constructor(address: Long, cap: Int) : super(address, null, -1, 0, cap, cap)
+
+        internal constructor(address: Long, container: ByteBuffer?, mark: Int, pos: Int, lim: Int, cap: Int) :
+                super(address, container, mark, pos, lim, cap)
+
+        override protected fun self(): Buffer {
+            return this
+        }
+
+        override protected fun getElementFactory(): $className {
+            return ELEMENT_FACTORY
+        }
+""")
+
+            members = publicMembers
+            if (members.any()) {
+                if (alias == null) {
+                    println()
+                    generateGettersKotlin(AccessMode.FLYWEIGHT, members)
+                }
+
+                if (hasMutableMembers()) {
+                    println()
+                    generateSettersKotlin(AccessMode.FLYWEIGHT, settableMembers)
+                }
+            }
+
+            print("""
+    }
+""")
+        }
+
+        // Recursively output inner classes for array-of-anonymous-nested-struct members.
+        this@Struct.members
+            .filter { it is StructMemberArray && it.nativeType is StructType && it.nativeType.name === ANONYMOUS }
+            .forEach { member ->
+                (member.nativeType as StructType).definition.apply {
+                    val writer = StringWriter(4 * 1024)
+                    PrintWriter(writer).use {
+                        it.generateKotlin(nested = true, level = level + 1)
+                    }
+                    println(writer.toString().replace("\n(?!$)".toRegex(), "\n    "))
+                }
+            }
+
+        print("""
+}""")
+    }
+
     private fun PrintWriter.generateOffsetFields(
         members: Sequence<StructMember>,
         indentation: String = "$t$t",
@@ -1200,6 +1723,30 @@ ${validations.joinToString("\n")}
                 // Output nested field offsets
                 if (member.isNestedStructDefinition)
                     generateOffsetFields(member.nestedMembers, "$indentation$t", field, true) // recursion
+            }
+        }
+    }
+
+    private fun PrintWriter.generateOffsetFieldsKotlin(
+        members: Sequence<StructMember>,
+        indentation: String = "$t$t",
+        parentField: String = "",
+        moreOverride: Boolean = false
+    ) {
+        members.forEachWithMore(moreOverride) { member, more ->
+            if (member.name === ANONYMOUS && member.isNestedStruct) {
+                generateOffsetFieldsKotlin(member.nestedMembers, indentation, parentField, more) // recursion
+            } else {
+                if (more)
+                    println("")
+
+                val field = member.offsetField(parentField)
+
+                print("$indentation val $field: Int")
+
+                // Output nested field offsets
+                if (member.isNestedStructDefinition)
+                    generateOffsetFieldsKotlin(member.nestedMembers, "$indentation$t", field, true) // recursion
             }
         }
     }
@@ -1231,6 +1778,31 @@ ${validations.joinToString("\n")}
                 // Output nested fields
                 if (it.isNestedStructDefinition)
                     index = generateOffsetInit(nativeLayout, (it.nativeType as StructType).definition.members, "$indentation$t", field, index) // recursion
+            }
+        }
+        return index
+    }
+
+    private fun PrintWriter.generateOffsetInitKotlin(
+        nativeLayout: Boolean,
+        members: List<StructMember>,
+        indentation: String = "$t$t$t",
+        parentField: String = "",
+        offset: Int = 0
+    ): Int {
+        var index = offset
+        members.forEach {
+            if (it.name === ANONYMOUS && it.isNestedStruct) {
+                index = generateOffsetInitKotlin(nativeLayout, (it.nativeType as StructType).definition.members, indentation, parentField, index + 1) // recursion
+            } else if (it is StructMemberPadding) {
+                index++
+            } else if (it.bits == -1) {
+                val field = it.offsetField(parentField)
+                println("$indentation$field = ${if (nativeLayout) "offsets.get" else "layout.offsetof"}(${index++})")
+
+                // Output nested fields
+                if (it.isNestedStructDefinition)
+                    index = generateOffsetInitKotlin(nativeLayout, (it.nativeType as StructType).definition.members, "$indentation$t", field, index) // recursion
             }
         }
         return index
@@ -1307,6 +1879,28 @@ ${validations.joinToString("\n")}
 """)
     }
 
+    private fun PrintWriter.generateMultiSetterKotlin(
+        javaDoc: String,
+        members: Sequence<StructMember>,
+        generateParameters: (Struct, PrintWriter, Sequence<StructMember>, String, MultiSetterMode, Boolean) -> Unit,
+        generateSetters: (Struct, PrintWriter, Sequence<StructMember>, String, MultiSetterMode) -> Unit,
+        mode: MultiSetterMode = MultiSetterMode.NORMAL
+    ) {
+        print("""
+    /** $javaDoc */""")
+        print("""
+    ${if(alias != null) "override " else ""}fun set(
+""")
+        generateParameters(this@Struct, this, members, "", mode, false)
+        println("""
+    ): $className {""")
+        generateSetters(this@Struct, this, members, "", mode)
+        print("""
+        return this
+    }
+""")
+    }
+
     private fun generateMultiSetterParameters(writer: PrintWriter, members: Sequence<StructMember>, parentMember: String, mode: MultiSetterMode, more: Boolean) {
         writer.apply {
             members.forEachWithMore(more) { it, more ->
@@ -1328,6 +1922,27 @@ ${validations.joinToString("\n")}
         }
     }
 
+    private fun generateMultiSetterParametersKotlin(writer: PrintWriter, members: Sequence<StructMember>, parentMember: String, mode: MultiSetterMode, more: Boolean) {
+        writer.apply {
+            members.forEachWithMore(more) { it, more ->
+                val method = it.field(parentMember)
+
+                if (it.isNestedStructDefinition) {
+                    generateMultiSetterParametersKotlin(writer, it.nestedMembers, method, mode, more) // recursion
+                    return@forEachWithMore
+                }
+
+                if (more)
+                    println(",")
+
+                print("$t$t")
+
+                val param = it.field(parentMember)
+                print("$param: ${it.nativeType.javaMethodType}")
+            }
+        }
+    }
+
     private fun generateMultiSetterSetters(writer: PrintWriter, members: Sequence<StructMember>, parentMember: String, mode: MultiSetterMode) {
         writer.apply {
             members.forEach {
@@ -1341,10 +1956,31 @@ ${validations.joinToString("\n")}
         }
     }
 
+    private fun generateMultiSetterSettersKotlin(writer: PrintWriter, members: Sequence<StructMember>, parentMember: String, mode: MultiSetterMode) {
+        writer.apply {
+            members.forEach {
+                val field = it.field(parentMember)
+
+                if (it.isNestedStructDefinition)
+                    generateMultiSetterSettersKotlin(writer, it.nestedMembers, field, mode) // recursion
+                else
+                    println("$t$t$field($field)")
+            }
+        }
+    }
+
     private fun generateAlternativeMultiSetter(members: Sequence<StructMember>): Boolean =
         members.any {
             if (it.isNestedStructDefinition)
                 generateAlternativeMultiSetter(it.nestedMembers) // recursion
+            else
+                it is StructMemberArray || it.nativeType.isPointerData
+        }
+
+    private fun generateAlternativeMultiSetterKotlin(members: Sequence<StructMember>): Boolean =
+        members.any {
+            if (it.isNestedStructDefinition)
+                generateAlternativeMultiSetterKotlin(it.nestedMembers) // recursion
             else
                 it is StructMemberArray || it.nativeType.isPointerData
         }
@@ -1386,6 +2022,43 @@ ${validations.joinToString("\n")}
         }
     }
 
+    private fun generateAlternativeMultiSetterParametersKotlin(writer: PrintWriter, members: Sequence<StructMember>, parentMember: String, mode: MultiSetterMode, more: Boolean) {
+        writer.apply {
+            members.forEachWithMore(more) { it, more ->
+                val method = it.field(parentMember)
+
+                if (it.isNestedStructDefinition) {
+                    generateAlternativeMultiSetterParameters(writer, it.nestedMembers, method, mode, more) // recursion
+                    return@forEachWithMore
+                }
+
+                if (more)
+                    println(",")
+
+                print(
+                    "$t$t${it.field(parentMember)}: ${it.nullable(
+                        if (it is StructMemberArray) {
+                            if (it.nativeType is CharType) {
+                                "ByteBuffer"
+                            } else if (it.nativeType is StructType)
+                                "${it.nativeType.javaMethodType}.Buffer"
+                            else
+                                it.primitiveMapping.toPointer.javaMethodName
+                        } else if (it.nativeType is PointerType<*> && it.nativeType.elementType is StructType) {
+                            val structType = it.nativeType.javaMethodType
+                            if (it.isStructBuffer)
+                                "$structType.Buffer"
+                            else
+                                structType
+                        } else
+                            it.nativeType.javaMethodType,
+                        if (it is StructMemberArray) it.arrayType else it.nativeType
+                    )}"
+                )
+            }
+        }
+    }
+
     private fun generateAlternativeMultiSetterSetters(writer: PrintWriter, members: Sequence<StructMember>, parentMember: String, mode: MultiSetterMode) {
         writer.apply {
             members.forEach {
@@ -1395,6 +2068,19 @@ ${validations.joinToString("\n")}
                     generateAlternativeMultiSetterSetters(writer, it.nestedMembers, field, mode) // recursion
                 else
                     println("$t$t$field($field);")
+            }
+        }
+    }
+
+    private fun generateAlternativeMultiSetterSettersKotlin(writer: PrintWriter, members: Sequence<StructMember>, parentMember: String, mode: MultiSetterMode) {
+        writer.apply {
+            members.forEach {
+                val field = it.field(parentMember)
+
+                if (it.isNestedStructDefinition)
+                    generateAlternativeMultiSetterSettersKotlin(writer, it.nestedMembers, field, mode) // recursion
+                else
+                    println("$t$t$field($field)")
             }
         }
     }
@@ -1658,10 +2344,204 @@ ${validations.joinToString("\n")}
         }
     }
 
+    private fun PrintWriter.generateStaticSettersKotlin(
+        members: Sequence<StructMember>,
+        parentStruct: Struct? = null,
+        parentMember: String = "",
+        parentField: String = "",
+        indent: String = "$t$t"
+    ) {
+        members.forEach {
+            if (it.has<UserDataMember>()) {
+                return@forEach
+            }
+
+            val setter = it.field(parentMember)
+            val field = getFieldOffset(it, parentStruct, parentField)
+
+            if (it.isNestedStruct) {
+                val nestedStruct = (it.nativeType as StructType).definition
+                val structType = nestedStruct.className
+                if (structType === ANONYMOUS)
+                    generateStaticSettersKotlin(
+                        it.nestedMembers, nestedStruct,
+                        if (it.name === ANONYMOUS) parentMember else setter,
+                        if (it.name === ANONYMOUS) parentField else field
+                    )
+                else {
+                    if (it.public)
+                        println("$indent/** Unsafe version of {@link #$setter($structType) $setter}. */")
+                    println("${indent}fun n$setter($STRUCT: Long, value: $structType) { memCopy(value.$ADDRESS, $STRUCT + $field, $structType.SIZEOF) }")
+                }
+            } else {
+                // Setter
+
+                if (it !is StructMemberArray && !it.nativeType.isPointerData) {
+                    if (it.nativeType is WrappedPointerType) {
+                        if (it.public)
+                            println("$indent/** Unsafe version of {@link #$setter(${it.nativeType.javaMethodType}) $setter}. */")
+                        print("${t}fun n$setter($STRUCT: Long, value: ${it.nullable(it.nativeType.javaMethodType)}) {")
+
+                        val userDataMember = if (it.nativeType is FunctionType) getReferenceMember<UserDataMember>(it.name) else null
+                        if (userDataMember != null) {
+                            print("\n$indent${t}memPutAddress($STRUCT + $field, ${(it.nativeType as FunctionType).function.className}.DELEGATE)")
+                            print("\n$indent${t}memPutAddress($STRUCT + ${getFieldOffset(userDataMember, parentStruct, parentField)}, ${it.addressValue})")
+                            println("\n$indent}")
+                        } else {
+                            println(" memPutAddress($STRUCT + $field, ${it.addressValue}) }")
+                        }
+                    } else {
+                        val javaType = it.nativeType.nativeMethodType
+
+                        if (it.public)
+                            println(
+                                if (it.has<AutoSizeMember>())
+                                    "$indent/** Sets the specified value to the {@code ${it.name}} field of the specified {@code struct}. */"
+                                else
+                                    "$indent/** Unsafe version of {@link #$setter(${if (it.nativeType.mapping == PrimitiveMapping.BOOLEAN4) "boolean" else javaType}) $setter}. */"
+                            )
+                        if (it.setter != null) {
+                            println("${t}fun n$setter($STRUCT: Long, value: $javaType) { ${it.setter}; }")
+                        } else if (it.bits != -1) {
+                            println("${t}public static native void n$setter($STRUCT: Long, value: $javaType);")
+                        } else {
+                            print("${t}fun n$setter($STRUCT: Long, value: $javaType) { ${getBufferMethod("put", it, javaType)}$STRUCT + $field, ")
+                            print(
+                                when {
+                                    javaType == "boolean"
+                                         -> "if(value) 1.toByte() else 0.toByte()"
+                                    it.nativeType.mapping === PointerMapping.OPAQUE_POINTER
+                                         -> it.pointerValue
+                                    else -> "value"
+                                }
+                            )
+                            println("); }")
+                        }
+                    }
+                }
+
+                // Alternative setters
+
+                if (it is StructMemberArray) {
+                    if (it.nativeType.dereference is StructType) {
+                        val structType = it.nativeType.javaMethodType
+                        if (it.nativeType is PointerType<*>) {
+                            if (it.public)
+                                println("$indent/** Unsafe version of {@link #$setter(PointerBuffer) $setter}. */")
+                            println("${t}fun n$setter($STRUCT: Long, value: PointerBuffer) {")
+                            if (Module.CHECKS)
+                                println("$indent${t}if (CHECKS) { checkGT(value, ${it.size}) }")
+                            println("$indent${t}memCopy(memAddress(value), $STRUCT + $field, value.remaining() * POINTER_SIZE)")
+                            setRemaining(it, prefix = "$indent$t", suffix = "\n")
+                            println("$indent}")
+                            val structTypeIndexed = "$structType${if (getReferenceMember<AutoSizeIndirect>(it.name) == null) "" else ".Buffer"}"
+                            if (it.public)
+                                println("$indent/** Unsafe version of {@link #$setter(int, $structTypeIndexed) $setter}. */")
+                            println("${indent}fun n$setter($STRUCT: Long, index: Int, value: ${it.nullable(structTypeIndexed)}) {")
+                            println("$indent${t}memPutAddress($STRUCT + $field + check(index, ${it.size}) * POINTER_SIZE, ${it.addressValue})")
+                            println("$indent}")
+                        } else {
+                            if (it.public)
+                                println("$indent/** Unsafe version of {@link #$setter($structType.Buffer) $setter}. */")
+                            println("${t}fun n$setter($STRUCT: Long, value: $structType.Buffer) {")
+                            if (Module.CHECKS)
+                                println("$indent${t}if (CHECKS) { checkGT(value, ${it.size}) }")
+                            println("$indent${t}memCopy(value.$ADDRESS, $STRUCT + $field, value.remaining() * $structType.SIZEOF)")
+                            setRemaining(it, prefix = "$indent$t", suffix = "\n")
+                            println("$indent}")
+                            if (it.public)
+                                println("$indent/** Unsafe version of {@link #$setter(int, $structType) $setter}. */")
+                            println("${t}fun n$setter($STRUCT: Long, index: Int, value: $structType) {")
+                            println("$indent${t}memCopy(value.$ADDRESS, $STRUCT + $field + check(index, ${it.size}) * $structType.SIZEOF, $structType.SIZEOF)")
+                            println("$indent}")
+                        }
+                    } else if (it.nativeType is CharType) {
+                        val mapping = it.nativeType.mapping as PrimitiveMapping
+                        val byteSize = if (mapping.bytes == 1) it.size else "${it.size} * ${mapping.bytes}"
+                        val nullTerminated = getReferenceMember<AutoSizeMember>(it.name) == null || it.has(NullTerminatedMember)
+
+                        if (it.public)
+                            println("$indent/** Unsafe version of {@link #$setter(ByteBuffer) $setter}. */")
+                        println("${t}fun n$setter($STRUCT: Long, value: ByteBuffer) {")
+                        if (Module.CHECKS) {
+                            println("$indent${t}if (CHECKS) {")
+                            if (nullTerminated) {
+                                println("$indent$t${t}checkNT${mapping.bytes}(value)")
+                            }
+                            println("$indent$t${t}checkGT(value, $byteSize)")
+                            println("$indent$t}")
+                        }
+                        println("$indent${t}memCopy(memAddress(value), $STRUCT + $field, value.remaining())")
+                        setRemaining(it, if (nullTerminated) mapping.bytes else 0, prefix = "$indent$t", suffix = "\n")
+                        println("$indent}")
+                    } else {
+                        val mapping = it.primitiveMapping
+                        val bufferType = mapping.toPointer.javaMethodName
+
+                        if (it.public)
+                            println("$indent/** Unsafe version of {@link #$setter($bufferType) $setter}. */")
+                        println("${t}fun n$setter($STRUCT: Long, value: $bufferType) {")
+                        if (Module.CHECKS)
+                            println("$indent${t}if (CHECKS) { checkGT(value, ${it.size}) }")
+                        println("$indent${t}memCopy(memAddress(value), $STRUCT + $field, value.remaining() * ${mapping.bytesExpression})")
+                        setRemaining(it, prefix = "$indent$t", suffix = "\n")
+                        println("$indent}")
+
+                        val javaType = it.nativeType.nativeMethodType
+
+                        if (it.public)
+                            println("$indent/** Unsafe version of {@link #$setter(int, $javaType) $setter}. */")
+                        println("${indent}fun n$setter($STRUCT: Long, index: Int, value: $javaType) {")
+                        println("$indent$t${getBufferMethod("put", it, javaType)}$STRUCT + $field + check(index, ${it.size}) * ${mapping.bytesExpression}, value)")
+                        println("$t}")
+                    }
+                } else if (it.nativeType is CharSequenceType) {
+                    val mapping = it.nativeType.charMapping
+                    val nullTerminated = getReferenceMember<AutoSizeMember>(it.name) == null || it.has(NullTerminatedMember)
+
+                    if (it.public)
+                        println("$indent/** Unsafe version of {@link #$setter(ByteBuffer) $setter}. */")
+                    println("${t}fun n$setter($STRUCT: Long, value: ${it.nullable("ByteBuffer")}) {")
+                    if (Module.CHECKS && nullTerminated)
+                        println("$indent${t}if (CHECKS) { checkNT${mapping.bytes}${if (it.isNullable) "Safe" else ""}(value) }")
+                    println("$indent${t}memPutAddress($STRUCT + $field, ${it.memAddressValue})")
+                    setRemaining(it, prefix = "$indent$t", suffix = "\n")
+                    println("$indent}")
+                } else if (it.nativeType.isPointerData) {
+                    val paramType = it.nativeType.javaMethodType
+                    if (it.nativeType.dereference is StructType) {
+                        if (it.isStructBuffer) {
+                            if (it.public)
+                                println("$indent/** Unsafe version of {@link #$setter($paramType.Buffer) $setter}. */")
+                            print("${indent}fun n$setter($STRUCT: Long, value: ${it.nullable("$paramType.Buffer")}) { memPutAddress($STRUCT + $field, ${it.addressValue})")
+                            setRemaining(it)
+                            println(" }")
+                        } else {
+                            if (it.public)
+                                println("$indent/** Unsafe version of {@link #$setter($paramType) $setter}. */")
+                            println("${indent}fun n$setter($STRUCT: Long, value: ${it.nullable(paramType)}) { memPutAddress($STRUCT + $field, ${it.addressValue}) }")
+                        }
+                    } else {
+                        if (it.public)
+                            println("$indent/** Unsafe version of {@link #$setter($paramType) $setter}. */")
+                        print("${indent}fun n$setter($STRUCT: Long, value: ${it.nullable(paramType)}) { memPutAddress($STRUCT + $field, ${it.memAddressValue})")
+                        setRemaining(it)
+                        println(" }")
+                    }
+                }
+            }
+        }
+    }
+
     private fun StructMember.annotate(
         type: String,
         nativeType: DataType = if (this is StructMemberArray) this.arrayType else this.nativeType
     ) = nullable(nativeType.annotate(type), nativeType)
+
+    private fun StructMember.annotateKotlin(
+        type: String,
+        nativeType: DataType = if (this is StructMemberArray) this.arrayType else this.nativeType
+    ) = nativeType.annotateKotlin(type)
 
     private fun StructMember.nullable(type: String, nativeType: DataType = this.nativeType) =
         if (nativeType.isReference && isNullable && nativeType !is CArrayType<*>) {
@@ -1796,6 +2676,115 @@ ${validations.joinToString("\n")}
                         println("$indent/** Sets the address of the specified {@link $pointerType} to the {@code $member} field. */")
                         if (overrides) println("$indent@Override")
                         println("${indent}public $returnType $setter(${it.annotate(pointerType)} value) { $n$setter($ADDRESS, value); return this; }")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun PrintWriter.generateSettersKotlin(
+        accessMode: AccessMode,
+        members: Sequence<StructMember>,
+        parentSetter: String = "",
+        parentMember: String = ""
+    ) {
+        val n = if (accessMode === AccessMode.INSTANCE) "n" else "$className.n"
+        members.forEach {
+            if (it.has<UserDataMember>()) {
+                return@forEach
+            }
+
+            val setter = it.field(parentSetter)
+            val member = it.fieldName(parentMember)
+
+            val indent = accessMode.indent
+            val overrides = alias != null /*
+                TODO: forward declarations have no members (see VkPhysicalDeviceBufferDeviceAddressFeaturesEXT)
+                && alias.members.any { parentMember -> parentMember.name == it.name }
+            */
+
+            val returnType = if (accessMode === AccessMode.INSTANCE)
+                className
+            else
+                "$className.Buffer"
+
+            if (it.isNestedStruct) {
+                val nestedStruct = (it.nativeType as StructType).definition
+                val structType = nestedStruct.className
+                if (structType === ANONYMOUS)
+                    generateSettersKotlin(
+                        accessMode,
+                        it.nestedMembers,
+                        if (it.name === ANONYMOUS) parentSetter else setter,
+                        if (it.name === ANONYMOUS) parentMember else member
+                    )
+                else {
+                    println("$indent/** Copies the specified {@link $structType} to the {@code $member} field. */")
+                    println("${indent}${if(overrides) "override " else ""}fun $setter(${it.annotateKotlin(structType)}value: $structType): $returnType { $n$setter($ADDRESS, value); return this }")
+                    if (nestedStruct.mutable) {
+                        println("$indent/** Passes the {@code $member} field to the specified Consumer. */")
+                        println("${indent}fun $setter(consumer: ($structType)->Unit): $className${if (accessMode === AccessMode.INSTANCE) "" else ".Buffer"} { consumer.invoke($setter()); return this }")
+                    }
+                }
+            } else {
+                // Setter
+
+                if (it !is StructMemberArray && !it.nativeType.isPointerData) {
+                    println("$indent/** Sets the specified value to the {@code $member} field. */")
+                    println("${indent}${if(overrides) "override " else ""}fun $setter(${it.annotate(it.nativeType.javaMethodType)} value): $returnType { $n$setter($ADDRESS, value${if (it.nativeType.mapping === PrimitiveMapping.BOOLEAN4) " ? 1 : 0" else ""}); return this }")
+                }
+
+                // Alternative setters
+
+                if (it is StructMemberArray) {
+                    if (it.nativeType.dereference is StructType) {
+                        val nestedStruct: Struct
+                        val structType = it.nativeType.javaMethodType
+                        val retType = "$structType${if (getReferenceMember<AutoSizeIndirect>(it.name) == null) "" else ".Buffer"}"
+                        if (it.nativeType is PointerType<*>) {
+                            nestedStruct = (it.nativeType.dereference as StructType).definition
+
+                            println("$indent/** Copies the specified {@link PointerBuffer} to the {@code $member} field. */")
+                            println("${indent}${if(overrides) "override " else ""}fun $setter(${it.annotateKotlin("PointerBuffer")}value: PointerBuffer): $returnType { $n$setter($ADDRESS, value); return this }")
+                            println("$indent/** Copies the address of the specified {@link $structType} at the specified index of the {@code $member} field. */")
+                        } else {
+                            nestedStruct = (it.nativeType as StructType).definition
+
+                            println("$indent/** Copies the specified {@link $structType.Buffer} to the {@code $member} field. */")
+                            println("${indent}${if(overrides) "override " else ""}fun $setter(${it.annotateKotlin("$structType.Buffer")}value: $structType.Buffer): $returnType { $n$setter($ADDRESS, value); return this }")
+                            println("$indent/** Copies the specified {@link $structType} at the specified index of the {@code $member} field. */")
+                        }
+                        println("${indent}${if(overrides) "override " else ""}fun $setter(index: Int, value: ${it.annotateKotlin(retType, it.nativeType)}): $returnType { $n$setter($ADDRESS, index, value); return this }")
+
+                        if (nestedStruct.mutable) {
+                            if (it.nativeType !is PointerType<*>) {
+                                println("$indent/** Passes the {@code $member} field to the specified Consumer. */")
+                                println("${indent}fun $setter(consumer: ($structType.Buffer)->Unit): $className${if (accessMode === AccessMode.INSTANCE) "" else ".Buffer"} { consumer.invoke($setter()); return this }")
+                            }
+                            println("$indent/** Passes the element at {@code index} of the {@code $member} field to the specified Consumer. */")
+                            println("${indent}fun $setter(index: Int, consumer: ($retType)->Unit): $className${if (accessMode === AccessMode.INSTANCE) "" else ".Buffer"} { consumer.invoke($setter(index)); return this }")
+                        }
+                    } else if (it.nativeType is CharType) {
+                        println("$indent/** Copies the specified encoded string to the {@code $member} field. */")
+                        println("${indent}${if(overrides) "override " else ""}fun $setter(${it.annotateKotlin("ByteBuffer")}value: ByteBuffer): $returnType { $n$setter($ADDRESS, value); return this }")
+                    } else {
+                        val bufferType = it.primitiveMapping.toPointer.javaMethodName
+                        println("$indent/** Copies the specified {@link $bufferType} to the {@code $member} field. */")
+                        println("${indent}${if(overrides) "override " else ""}fun $setter(${it.annotateKotlin(bufferType)}value: $bufferType): $returnType { $n$setter($ADDRESS, value); return this }")
+                        println("$indent/** Sets the specified value at the specified index of the {@code $member} field. */")
+                        println("${indent}${if(overrides) "override " else ""}fun $setter(index: Int, ${it.annotateKotlin(it.nativeType.javaMethodType, it.nativeType)}value: ${it.nativeType.javaMethodType}): $returnType { $n$setter($ADDRESS, index, value); return this }")
+                    }
+                } else if (it.nativeType is CharSequenceType) {
+                    println("$indent/** Sets the address of the specified encoded string to the {@code $member} field. */")
+                    println("${indent}${if(overrides) "override " else ""}fun $setter(${it.annotateKotlin("ByteBuffer")}value: ByteBuffer): $returnType { $n$setter($ADDRESS, value); return this }")
+                } else if (it.nativeType.isPointerData) {
+                    val pointerType = it.nativeType.javaMethodType
+                    if ((it.nativeType as PointerType<*>).elementType is StructType && it.isStructBuffer) {
+                        println("$indent/** Sets the address of the specified {@link $pointerType.Buffer} to the {@code $member} field. */")
+                        println("${indent}${if(overrides) "override " else ""}fun $setter(${it.annotateKotlin("$pointerType.Buffer")}value: $pointerType.Buffer): $returnType { $n$setter($ADDRESS, value); return this }")
+                    } else {
+                        println("$indent/** Sets the address of the specified {@link $pointerType} to the {@code $member} field. */")
+                        println("${indent}${if(overrides) "override " else ""}fun $setter(${it.annotateKotlin(pointerType)}value: $pointerType): $returnType { $n$setter($ADDRESS, value); return this }")
                     }
                 }
             }
@@ -1955,6 +2944,160 @@ ${validations.joinToString("\n")}
         }
     }
 
+    private fun PrintWriter.generateStaticGettersKotlin(
+        members: Sequence<StructMember>,
+        parentStruct: Struct? = null,
+        parentGetter: String = "",
+        parentField: String = "",
+        indent: String = "$t$t"
+    ) {
+        members.forEach {
+            if (it.has<UserDataMember>()) {
+                return@forEach
+            }
+
+            val getter = it.field(parentGetter)
+            val field = getFieldOffset(it, parentStruct, parentField)
+
+            if (it.isNestedStruct) {
+                val nestedStruct = (it.nativeType as StructType).definition
+                val structType = nestedStruct.className
+                if (structType === ANONYMOUS)
+                    generateStaticGettersKotlin(
+                        it.nestedMembers, nestedStruct,
+                        if (it.name === ANONYMOUS) parentGetter else getter,
+                        if (it.name === ANONYMOUS) parentField else field
+                    )
+                else {
+                    if (it.public)
+                        println("$indent/** Unsafe version of {@link #$getter}. */")
+                    println("${indent}fun n$getter($STRUCT: Long): $structType { return $structType.create($STRUCT + $field) }")
+                }
+            } else {
+                // Getter
+
+                if (it !is StructMemberArray && !it.nativeType.isPointerData) {
+                    if (it.public)
+                        println("$indent/** Unsafe version of {@link #$getter}. */")
+                    if (it.nativeType is FunctionType) {
+                        val callbackField = getReferenceMember<UserDataMember>(it.name).let { userDataMember ->
+                            if (userDataMember == null)
+                                field
+                            else
+                                getFieldOffset(userDataMember, parentStruct, parentField)
+                        }
+                        println("$indent${it.nullable("public")} fun n$getter($STRUCT: Long): ${it.nativeType.className} { return ${it.construct(it.nativeType.className)}(memGetAddress($STRUCT + $callbackField); }")
+                    } else if (it.getter != null) {
+                        println("${indent}fun n$getter($STRUCT: Long): ${it.nativeType.nativeMethodType} { return ${it.getter} }")
+                    } else if (it.bits != -1) {
+                        println("${indent}external fun n$getter($STRUCT: Long): ${it.nativeType.nativeMethodType}")
+                    } else {
+                        val javaType = it.nativeType.nativeMethodType
+
+                        print("${indent}fun n$getter($STRUCT: Long): $javaType { return ${getBufferMethod("get", it, javaType)}$STRUCT + $field)")
+                        if (it.nativeType.mapping === PrimitiveMapping.BOOLEAN)
+                            print(" != 0")
+                        println(" }")
+                    }
+                }
+
+                // Alternative getters
+
+                if (it is StructMemberArray) {
+                    if (it.nativeType.dereference is StructType) {
+                        val nestedStruct = it.nativeType.javaMethodType
+                        val size = getReferenceMember<AutoSizeMember>(it.name)?.autoSize ?: it.size
+                        if (it.nativeType is PointerType<*>) {
+                            val autoSizeIndirect = getReferenceMember<AutoSizeIndirect>(it.name)
+
+                            if (it.public)
+                                println("$indent/** Unsafe version of {@link #$getter}. */")
+                            println("${indent}fun n$getter($STRUCT: Long): PointerBuffer { return ${it.mem("PointerBuffer")}($STRUCT + $field, $size) }")
+                            if (it.public)
+                                println("$indent/** Unsafe version of {@link #$getter(int) $getter}. */")
+                            println("$indent${it.nullable("public")} fun n$getter($STRUCT: Long, index: Int): $nestedStruct${if (autoSizeIndirect == null) "" else ".Buffer"} {")
+                            println("$indent${t}return ${it.construct(nestedStruct)}(memGetAddress($STRUCT + $field + check(index, $size) * POINTER_SIZE)${
+                            if (autoSizeIndirect == null) "" else ", n${autoSizeIndirect.name}($STRUCT)"
+                            })")
+                            println("$indent}")
+                        } else {
+                            if (it.public)
+                                println("$indent/** Unsafe version of {@link #$getter}. */")
+                            println("${indent}fun n$getter($STRUCT: Long): $nestedStruct.Buffer { return ${it.construct(nestedStruct)}($STRUCT + $field, $size) }")
+                            if (it.public)
+                                println("$indent/** Unsafe version of {@link #$getter(int) $getter}. */")
+                            println("$indent${it.nullable("public")} fun n$getter($STRUCT: Long, index: Int): $nestedStruct {")
+                            println("$indent${t}return ${it.construct(nestedStruct)}($STRUCT + $field + check(index, $size) * $nestedStruct.SIZEOF)")
+                            println("$indent}")
+                        }
+                    } else if (it.nativeType is CharType) {
+                        val mapping = it.nativeType.mapping
+                        val capacity = getReferenceMember<AutoSizeMember>(it.name)
+                        val byteSize = capacity?.autoSize ?: if (mapping.bytes == 1) it.size else "${it.size} * ${mapping.bytes}"
+
+                        if (it.public)
+                            println("$indent/** Unsafe version of {@link #$getter}. */")
+                        println("${indent}fun n$getter($STRUCT: Long): ByteBuffer { return memByteBuffer($STRUCT + $field, $byteSize) }")
+                        if (it.public)
+                            println("$indent/** Unsafe version of {@link #${getter}String}. */")
+                        println("${indent}fun n${getter}String($STRUCT: Long): String { return mem${mapping.charset}(${if (capacity != null) "n$getter($STRUCT)" else "$STRUCT + $field"}) }")
+                    } else {
+                        val mapping = it.primitiveMapping
+                        val bufferType = mapping.toPointer.javaMethodName
+
+                        if (it.public)
+                            println("$t/** Unsafe version of {@link #$getter}. */")
+                        println("${t}fun n$getter($STRUCT: Long): $bufferType { return ${it.mem(bufferType)}($STRUCT + $field, ${getReferenceMember<AutoSizeMember>(it.name)?.autoSize ?: it.size}) }")
+
+                        val javaType = it.nativeType.nativeMethodType
+
+                        if (it.public)
+                            println("$indent/** Unsafe version of {@link #$getter(int) $getter}. */")
+                        println("${indent}fun n$getter($STRUCT: Long, index: Int): $javaType {")
+                        print("$indent${t}return ${getBufferMethod("get", it, javaType)}$STRUCT + $field + check(index, ${it.size}) * ${mapping.bytesExpression})")
+                        if (it.nativeType.mapping === PrimitiveMapping.BOOLEAN)
+                            print(" != 0")
+                        println("\n$indent}")
+                    }
+                } else if (it.nativeType is CharSequenceType) {
+                    val mapping = it.nativeType.charMapping
+                    if (it.public)
+                        println("$indent/** Unsafe version of {@link #$getter}. */")
+                    println("$indent${it.nullable("public")} fun n$getter($STRUCT: Long): ByteBuffer { return ${it.mem("ByteBufferNT${mapping.bytes}")}(memGetAddress($STRUCT + $field)) }")
+                    if (it.public)
+                        println("$indent/** Unsafe version of {@link #${getter}String}. */")
+                    println("$indent${it.nullable("public")} fun n${getter}String($STRUCT: Long): String { return ${it.mem(mapping.charset)}(memGetAddress($STRUCT + $field)) }")
+                } else if (it.nativeType.isPointerData) {
+                    val returnType = it.nativeType.javaMethodType
+                    if (it.nativeType.dereference is StructType) {
+                        if (it.public)
+                            println("$indent/** Unsafe version of {@link #$getter}. */")
+                        println(if (it.isStructBuffer) {
+                            val capacity = getReferenceMember<AutoSizeMember>(it.name)
+                            if (capacity == null)
+                                "$indent${it.nullable("public")} fun n$getter($STRUCT: Long, $BUFFER_CAPACITY_PARAM: Int): $returnType.Buffer { return ${it.construct(returnType)}(memGetAddress($STRUCT + $field), $BUFFER_CAPACITY_PARAM) }"
+                            else
+                                "$indent${it.nullable("public")} fun n$getter($STRUCT: Long): $returnType.Buffer { return ${it.construct(returnType)}(memGetAddress($STRUCT + $field), ${capacity.autoSize}) }"
+                        } else
+                            "$indent${it.nullable("public")} fun n$getter($STRUCT: Long): $returnType { return ${it.construct(returnType)}(memGetAddress($STRUCT + $field)) }"
+                        )
+                    } else {
+                        val capacity = getReferenceMember<AutoSizeMember>(it.name)
+                        if (capacity == null) {
+                            if (it.public)
+                                println("$indent/** Unsafe version of {@link #$getter(int) $getter}. */")
+                            println("$indent${it.nullable("public")} fun n$getter($STRUCT: Long, $BUFFER_CAPACITY_PARAM: Int): $returnType { return ${it.mem(returnType)}(memGetAddress($STRUCT + $field), $BUFFER_CAPACITY_PARAM) }")
+                        } else {
+                            if (it.public)
+                                println("$indent/** Unsafe version of {@link #$getter() $getter}. */")
+                            println("$indent${it.nullable("public")} fun n$getter($STRUCT: Long): $returnType { return ${it.mem(returnType)}(memGetAddress($STRUCT + $field), ${capacity.autoSize}) }")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private fun PrintWriter.generateGetterAnnotations(indent: String, member: StructMember, type: String, nativeType: NativeType = member.nativeType) {
         if (nativeType.isReference && member.isNullable) {
             println("$indent@Nullable")
@@ -2091,6 +3234,139 @@ $indent */""")
                             println("$indent/** Returns a {@link $returnType} view of the data pointed to by the {@code $member} field. */")
                             generateGetterAnnotations(indent, it, returnType)
                             println("${indent}public $returnType $getter() { return $n$getter($ADDRESS); }")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun PrintWriter.generateGettersKotlin(
+        accessMode: AccessMode,
+        members: Sequence<StructMember>,
+        parentGetter: String = "",
+        parentMember: String = ""
+    ) {
+        val n = if (accessMode === AccessMode.INSTANCE) "n" else "$className.n"
+        members.forEach {
+            if (it.has<UserDataMember>()) {
+                return@forEach
+            }
+
+            val getter = it.field(parentGetter)
+            val member = it.fieldName(parentMember)
+
+            val indent = accessMode.indent
+
+            if (it.isNestedStruct) {
+                val structType = it.nativeType.javaMethodType
+                if (structType === ANONYMOUS)
+                    generateGettersKotlin(
+                        accessMode,
+                        it.nestedMembers,
+                        if (it.name === ANONYMOUS) parentGetter else getter,
+                        if (it.name === ANONYMOUS) parentMember else member
+                    )
+                else {
+                    println("$indent/** Returns a {@link $structType} view of the {@code $member} field. */")
+                    generateGetterAnnotations(indent, it, structType)
+                    println("${indent}fun $getter(): $structType { return $n$getter($ADDRESS) }")
+                }
+            } else {
+                // Getter
+
+                if (it !is StructMemberArray && !it.nativeType.isPointerData) {
+                    val returnType = when (it.nativeType) {
+                        is FunctionType       -> it.nativeType.className
+                        is WrappedPointerType -> "long"
+                        else                  -> it.nativeType.javaMethodType
+                    }
+                    println("$indent/** Returns the value of the {@code $member} field. */")
+                    generateGetterAnnotations(indent, it, returnType)
+                    println("${indent}fun $getter(): $returnType { return $n$getter($ADDRESS)${if (it.nativeType.mapping === PrimitiveMapping.BOOLEAN4) " != 0" else ""} }")
+                }
+
+                // Alternative getters
+
+                if (it is StructMemberArray) {
+                    if (it.nativeType.dereference is StructType) {
+                        val structType = it.nativeType.javaMethodType
+                        if (it.nativeType is PointerType<*>) {
+                            println("$indent/** Returns a {@link PointerBuffer} view of the {@code $member} field. */")
+                            generateGetterAnnotations(indent, it, "PointerBuffer", it.arrayType)
+                            println("${indent}fun $getter(): PointerBuffer { return $n$getter($ADDRESS) }")
+
+                            val retType = "$structType${if (getReferenceMember<AutoSizeIndirect>(it.name) == null) "" else ".Buffer"}"
+                            println("$indent/** Returns a {@link $structType} view of the pointer at the specified index of the {@code $member} field. */")
+                            generateGetterAnnotations(indent, it, retType)
+                            println("${indent}fun $getter(index: Int): $retType { return $n$getter($ADDRESS, index) }")
+                        } else {
+                            println("$indent/** Returns a {@link $structType}.Buffer view of the {@code $member} field. */")
+                            generateGetterAnnotations(indent, it, "$structType.Buffer", it.arrayType)
+                            println("${indent}fun $getter(): $structType.Buffer { return $n$getter($ADDRESS) }")
+                            println("$indent/** Returns a {@link $structType} view of the struct at the specified index of the {@code $member} field. */")
+                            generateGetterAnnotations(indent, it, structType)
+                            println("${indent}fun $getter(index: Int): $structType { return $n$getter($ADDRESS, index) }")
+                        }
+                    } else if (it.nativeType is CharType) {
+                        println("$indent/** Returns a {@link ByteBuffer} view of the {@code $member} field. */")
+                        generateGetterAnnotations(indent, it, "ByteBuffer", it.arrayType)
+                        println("${indent}fun $getter(): ByteBuffer { return $n$getter($ADDRESS) }")
+                        println("$indent/** Decodes the null-terminated string stored in the {@code $member} field. */")
+                        generateGetterAnnotations(indent, it, "String", it.arrayType)
+                        println("${indent}fun ${getter}String(): String { return $n${getter}String($ADDRESS) }")
+                    } else {
+                        val bufferType = it.primitiveMapping.toPointer.javaMethodName
+                        println("$indent/** Returns a {@link $bufferType} view of the {@code $member} field. */")
+                        generateGetterAnnotations(indent, it, bufferType, it.arrayType)
+                        println("${indent}fun $getter(): $bufferType { return $n$getter($ADDRESS) }")
+                        println("$indent/** Returns the value at the specified index of the {@code $member} field. */")
+                        generateGetterAnnotations(indent, it, it.nativeType.nativeMethodType)
+                        println("${indent}fun $getter(index: Int): ${it.nativeType.nativeMethodType} { return $n$getter($ADDRESS, index) }")
+                    }
+                } else if (it.nativeType is CharSequenceType) {
+                    println("$indent/** Returns a {@link ByteBuffer} view of the null-terminated string pointed to by the {@code $member} field. */")
+                    generateGetterAnnotations(indent, it, "ByteBuffer")
+                    println("${indent}fun $getter(): ByteBuffer { return $n$getter($ADDRESS) }")
+                    println("$indent/** Decodes the null-terminated string pointed to by the {@code $member} field. */")
+                    generateGetterAnnotations(indent, it, "String")
+                    println("${indent}fun ${getter}String(): String { return $n${getter}String($ADDRESS) }")
+                } else if (it.nativeType.isPointerData) {
+                    val returnType = it.nativeType.javaMethodType
+                    if (it.nativeType.dereference is StructType) {
+                        if (it.isStructBuffer) {
+                            if (getReferenceMember<AutoSizeMember>(it.name) == null) {
+                                println("""$indent/**
+$indent * Returns a {@link $returnType.Buffer} view of the struct array pointed to by the {@code $member} field.
+$indent *
+$indent * @param $BUFFER_CAPACITY_PARAM the number of elements in the returned buffer
+$indent */""")
+                                generateGetterAnnotations(indent, it, "$returnType.Buffer")
+                                println("${indent}fun $getter($BUFFER_CAPACITY_PARAM: Int): $returnType.Buffer { return $n$getter($ADDRESS, $BUFFER_CAPACITY_PARAM) }")
+                            } else {
+                                println("$indent/** Returns a {@link $returnType.Buffer} view of the struct array pointed to by the {@code $member} field. */")
+                                generateGetterAnnotations(indent, it, "$returnType.Buffer")
+                                println("${indent}fun $getter(): $returnType.Buffer { return $n$getter($ADDRESS) }")
+                            }
+                        } else {
+                            println("$indent/** Returns a {@link $returnType} view of the struct pointed to by the {@code $member} field. */")
+                            generateGetterAnnotations(indent, it, returnType)
+                            println("${indent}fun $getter(): $returnType { return $n$getter($ADDRESS) }")
+                        }
+                    } else {
+                        if (getReferenceMember<AutoSizeMember>(it.name) == null) {
+                            println(
+                                """$indent/**
+$indent * Returns a {@link $returnType} view of the data pointed to by the {@code $member} field.
+$indent *
+$indent * @param $BUFFER_CAPACITY_PARAM the number of elements in the returned buffer
+$indent */""")
+                            generateGetterAnnotations(indent, it, returnType)
+                            println("${indent}fun $getter($BUFFER_CAPACITY_PARAM: Int): $returnType { return $n$getter($ADDRESS, $BUFFER_CAPACITY_PARAM) }")
+                        } else {
+                            println("$indent/** Returns a {@link $returnType} view of the data pointed to by the {@code $member} field. */")
+                            generateGetterAnnotations(indent, it, returnType)
+                            println("${indent}fun $getter(): $returnType { return $n$getter($ADDRESS) }")
                         }
                     }
                 }

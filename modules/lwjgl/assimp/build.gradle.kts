@@ -11,12 +11,10 @@ repositories {
     mavenCentral()
 }
 
-kotlin {
-    sourceSets["main"].apply {
-        kotlin.srcDir("src/main/kotlin")
-
-        dependencies {
-            implementation(kotlin("stdlib"))
+sourceSets {
+    create("templates.assimp") {
+        java {
+            srcDirs("src/templates/kotlin")
         }
     }
 }
